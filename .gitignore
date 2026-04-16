@@ -1,0 +1,17 @@
+# Personal data
+history.json
+pins.json
+config.json
+templates.json
+
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor temp files
+*.tmp
+*.tmp.*
+tmp/
