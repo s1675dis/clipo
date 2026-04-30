@@ -38,6 +38,7 @@ CONFIG_FILE    = _BASE_DIR / "config.json"
 TEMPLATES_FILE = _BASE_DIR / "templates.json"
 PINS_FILE      = _BASE_DIR / "pins.json"
 DOUBLE_CTRL_INTERVAL = 0.4  # ダブルCtrl判定間隔（秒）
+_CF_HDROP = 15              # Windows クリップボード形式: ファイルドロップ
 POPUP_INIT_WIDTH  = 236   # ポップアップ初期幅（px）
 POPUP_INIT_HEIGHT = 380   # ポップアップ初期高さ（px）
 POPUP_MAX_ROWS = 15       # ポップアップに表示する最大行数
@@ -136,34 +137,73 @@ def save_history() -> None:
 
 # ---------- クリップボード監視 ----------
 
-def watch_clipboard(icon: pystray.Icon) -> None:
-    prev = ""
+def _get_clipboard_filenames() -> list[str]:
+    """クリップボードに CF_HDROP 形式のファイルがある場合、そのフルパスリストを返す。
+    クリップボードの内容は一切変更しない。
+    """
+    result = []
     try:
-        prev = pyperclip.paste()
+        if not ctypes.windll.user32.OpenClipboard(None):
+            return result
+        try:
+            h = ctypes.windll.user32.GetClipboardData(_CF_HDROP)
+            if not h:
+                return result
+            count = ctypes.windll.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+            for i in range(count):
+                length = ctypes.windll.shell32.DragQueryFileW(h, i, None, 0)
+                if length:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    ctypes.windll.shell32.DragQueryFileW(h, i, buf, length + 1)
+                    result.append(buf.value)
+        finally:
+            ctypes.windll.user32.CloseClipboard()
     except Exception:
         pass
+    return result
+
+
+def watch_clipboard(icon: pystray.Icon) -> None:
+    prev_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
 
     while not getattr(icon, "_stop_event", threading.Event()).is_set():
         try:
-            current = pyperclip.paste()
+            seq = ctypes.windll.user32.GetClipboardSequenceNumber()
         except Exception:
             time.sleep(POLL_INTERVAL)
             continue
 
-        if current and current != prev:
-            prev = current
-            entry = {
-                "text": current,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            with history_lock:
-                # 重複エントリを先頭に移動
-                history[:] = [h for h in history if h["text"] != current]
-                history.insert(0, entry)
-                if len(history) > MAX_HISTORY:
-                    history.pop()
-            save_history()
-            icon.update_menu()
+        if seq == prev_seq:
+            time.sleep(POLL_INTERVAL)
+            continue
+        prev_seq = seq
+
+        # テキストを優先取得
+        current = ""
+        try:
+            current = pyperclip.paste()
+        except Exception:
+            pass
+
+        # テキストが空なら CF_HDROP（ファイルコピー）を確認し、ファイル名を記録する
+        # クリップボード本体は変更しないため、通常のファイル貼り付けは阻害されない
+        if not current:
+            paths = _get_clipboard_filenames()
+            if paths:
+                current = "\n".join(Path(p).name for p in paths)
+
+        if not current:
+            continue
+
+        with history_lock:
+            if history and history[0]["text"] == current:
+                continue
+            history[:] = [h for h in history if h["text"] != current]
+            history.insert(0, {"text": current, "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+            if len(history) > MAX_HISTORY:
+                history.pop()
+        save_history()
+        icon.update_menu()
 
         time.sleep(POLL_INTERVAL)
 
@@ -218,10 +258,11 @@ def on_quit(icon: pystray.Icon, item) -> None:
 
 
 def on_settings(icon: pystray.Icon) -> None:
-    threading.Thread(target=show_settings_window, args=(icon,), daemon=True).start()
+    _settings_icon_ref[0] = icon
+    _settings_trigger.set()
 
 
-def show_settings_window(icon: pystray.Icon) -> None:
+def show_settings_window(icon: pystray.Icon, parent: tk.Misc | None = None) -> None:
     """設定ウィンドウを表示する。"""
     BG  = "#2b2b2b"
     FG  = "#dcdcdc"
@@ -229,7 +270,7 @@ def show_settings_window(icon: pystray.Icon) -> None:
     ACC = "#0078d4"
     LABEL_W = 20
 
-    root = tk.Tk()
+    root = tk.Toplevel(parent) if parent is not None else tk.Tk()
     root.title("clipo - 設定")
     root.configure(bg=BG)
     root.resizable(True, False)
@@ -427,7 +468,10 @@ def show_settings_window(icon: pystray.Icon) -> None:
     root.geometry(f"{dw}x{dh}+{(sw - dw)//2}+{(sh - dh)//2}")
 
     root.bind("<Escape>", _close_settings)
-    root.mainloop()
+    if parent is not None:
+        root.wait_window(root)
+    else:
+        root.mainloop()
 
 
 # ---------- スタートアップ登録 ----------
@@ -1111,7 +1155,15 @@ def _setup_resize(root: tk.Tk, min_w: int = 200, min_h: int = 120) -> None:
     root.bind_all("<B1-Motion>",       on_drag,    add=True)
     root.bind_all("<ButtonRelease-1>", on_release, add=True)
 
-def show_popup(icon) -> None:
+# ---------- ポップアップ事前初期化 ----------
+_popup_trigger    = threading.Event()  # ホットキー検出 → ワーカーへのシグナル
+_popup_active     = threading.Event()  # ポップアップ実行中フラグ（多重起動防止）
+_popup_icon_ref: list   = [None]       # icon の参照渡し用
+_settings_trigger = threading.Event()  # 設定ウィンドウ表示トリガー
+_settings_icon_ref: list = [None]      # 設定ウィンドウ用 icon 参照
+
+
+def show_popup(icon, _root: tk.Tk | None = None) -> None:
     """コンテキストメニュー風ポップアップ。タブで履歴／定型文を切り替える。"""
     with history_lock:
         current_history = list(history)
@@ -1119,7 +1171,7 @@ def show_popup(icon) -> None:
     pins = load_pins()
 
     # ---- カーソル位置を取得 ----
-    root = tk.Tk()
+    root = _root or tk.Tk()
     cx = root.winfo_pointerx()
     cy = root.winfo_pointery()
 
@@ -1809,6 +1861,7 @@ def show_popup(icon) -> None:
     refresh_templates()
     refresh_pins()
     switch_tab("history")
+    root.deiconify()  # 事前初期化時に withdraw されている場合に表示
     search_entry.focus_force()  # ウィンドウの OS フォーカス取得 + 検索バーへのフォーカスを同時に行う
     root.mainloop()
 
@@ -1861,20 +1914,43 @@ def _watch_click_outside(root: tk.Tk, block_fn=None, interval_ms: int = 50) -> N
 
 # ---------- ダブルCtrl 検出 ----------
 
+def _popup_prewarm_loop() -> None:
+    """Tk を事前初期化し、ホットキー／設定トリガーを待って処理するループ。
+    ポップアップが閉じている間に次回用の Tk インタープリターを作成しておくことで
+    ポップアップ表示までの遅延を削減する。
+    設定ウィンドウも同スレッドで処理することで複数 Tk インスタンスの競合を防ぐ。
+    """
+    while True:
+        root = tk.Tk()
+        root.withdraw()
+
+        def _check(_root=root):
+            if _settings_trigger.is_set():
+                _settings_trigger.clear()
+                show_settings_window(_settings_icon_ref[0], _root)
+            if _popup_trigger.is_set():
+                _root.quit()
+                return
+            _root.after(50, _check)
+
+        root.after(50, _check)
+        root.mainloop()  # _check が quit() を呼ぶまでここで待機
+
+        _popup_trigger.clear()
+        icon = _popup_icon_ref[0]
+        _popup_active.set()
+        try:
+            show_popup(icon, root)
+        finally:
+            _popup_active.clear()
+
+
 def start_hotkey_listener(icon) -> None:
     """Ctrl キーの2連打を検出してポップアップを呼び出す。
     キーリピートを除外するため、キーアップ → キーダウンの遷移だけをカウントする。
     """
     last_ctrl_time = 0.0
     _ctrl_held = False          # Ctrl が現在押しっぱなしかどうか
-    _popup_open = threading.Event()
-
-    def _run_popup():
-        _popup_open.set()
-        try:
-            show_popup(icon)
-        finally:
-            _popup_open.clear()
 
     def on_ctrl_down(_):
         nonlocal last_ctrl_time, _ctrl_held
@@ -1885,8 +1961,9 @@ def start_hotkey_listener(icon) -> None:
         now = time.monotonic()
         if now - last_ctrl_time <= DOUBLE_CTRL_INTERVAL:
             last_ctrl_time = 0.0  # リセット（3連打対策）
-            if not _popup_open.is_set():
-                threading.Thread(target=_run_popup, daemon=True).start()
+            if not _popup_active.is_set():
+                _popup_icon_ref[0] = icon
+                _popup_trigger.set()
         else:
             last_ctrl_time = now
 
@@ -1953,6 +2030,9 @@ def main() -> None:
     # クリップボード監視スレッド
     watcher = threading.Thread(target=watch_clipboard, args=(icon,), daemon=True)
     watcher.start()
+
+    # ポップアップ事前初期化ワーカー（Tk を先行作成して起動遅延を削減）
+    threading.Thread(target=_popup_prewarm_loop, daemon=True).start()
 
     # ダブルCtrl ホットキーリスナー
     start_hotkey_listener(icon)
