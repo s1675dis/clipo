@@ -139,44 +139,42 @@ def save_history() -> None:
 # ---------- クリップボード監視 ----------
 
 def _read_clipboard() -> str:
-    """CF_HDROP（ファイル名）または CF_UNICODETEXT（テキスト）をクリップボードから読む。
-    クリップボードは 1 回だけ開いて両フォーマットを確認する。
-    OpenClipboard 失敗時は最大 3 回リトライする。
+    """クリップボードの内容を文字列として返す。
+    CF_HDROP（ファイルコピー）を優先し、なければ pyperclip でテキストを取得する。
+    IsClipboardFormatAvailable でフォーマットを先に判定することで
+    クリップボードの二重オープンを避ける。
     """
-    for _ in range(3):
-        if not ctypes.windll.user32.OpenClipboard(None):
-            time.sleep(0.02)
-            continue
-        try:
-            # ファイルコピー（CF_HDROP）を優先
-            h = ctypes.windll.user32.GetClipboardData(_CF_HDROP)
-            if h:
-                count = ctypes.windll.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
-                names = []
-                for i in range(count):
-                    length = ctypes.windll.shell32.DragQueryFileW(h, i, None, 0)
-                    if length:
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        ctypes.windll.shell32.DragQueryFileW(h, i, buf, length + 1)
-                        names.append(Path(buf.value).name)
-                if names:
-                    return "\n".join(names)
+    if ctypes.windll.user32.IsClipboardFormatAvailable(_CF_HDROP):
+        # ファイルコピー: CF_HDROP からファイル名のみ抽出
+        for _ in range(3):
+            if not ctypes.windll.user32.OpenClipboard(None):
+                time.sleep(0.02)
+                continue
+            try:
+                h = ctypes.windll.user32.GetClipboardData(_CF_HDROP)
+                if h:
+                    count = ctypes.windll.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+                    names = []
+                    for i in range(count):
+                        length = ctypes.windll.shell32.DragQueryFileW(h, i, None, 0)
+                        if length:
+                            buf = ctypes.create_unicode_buffer(length + 1)
+                            ctypes.windll.shell32.DragQueryFileW(h, i, buf, length + 1)
+                            names.append(Path(buf.value).name)
+                    if names:
+                        return "\n".join(names)
+            except Exception:
+                pass
+            finally:
+                ctypes.windll.user32.CloseClipboard()
+            break
+        return ""
 
-            # テキスト（CF_UNICODETEXT）を確認
-            h = ctypes.windll.user32.GetClipboardData(_CF_UNICODETEXT)
-            if h:
-                ptr = ctypes.windll.kernel32.GlobalLock(h)
-                if ptr:
-                    try:
-                        return ctypes.wstring_at(ptr)
-                    finally:
-                        ctypes.windll.kernel32.GlobalUnlock(h)
-        except Exception:
-            pass
-        finally:
-            ctypes.windll.user32.CloseClipboard()
-        break
-    return ""
+    # テキストコピー: pyperclip に委譲（CF_UNICODETEXT の読み取りを担当）
+    try:
+        return pyperclip.paste()
+    except Exception:
+        return ""
 
 
 def watch_clipboard(icon: pystray.Icon) -> None:
