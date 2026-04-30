@@ -38,7 +38,8 @@ CONFIG_FILE    = _BASE_DIR / "config.json"
 TEMPLATES_FILE = _BASE_DIR / "templates.json"
 PINS_FILE      = _BASE_DIR / "pins.json"
 DOUBLE_CTRL_INTERVAL = 0.4  # ダブルCtrl判定間隔（秒）
-_CF_HDROP = 15              # Windows クリップボード形式: ファイルドロップ
+_CF_HDROP        = 15   # Windows クリップボード形式: ファイルドロップ
+_CF_UNICODETEXT  = 13   # Windows クリップボード形式: Unicode テキスト
 POPUP_INIT_WIDTH  = 236   # ポップアップ初期幅（px）
 POPUP_INIT_HEIGHT = 380   # ポップアップ初期高さ（px）
 POPUP_MAX_ROWS = 15       # ポップアップに表示する最大行数
@@ -137,30 +138,45 @@ def save_history() -> None:
 
 # ---------- クリップボード監視 ----------
 
-def _get_clipboard_filenames() -> list[str]:
-    """クリップボードに CF_HDROP 形式のファイルがある場合、そのフルパスリストを返す。
-    クリップボードの内容は一切変更しない。
+def _read_clipboard() -> str:
+    """CF_HDROP（ファイル名）または CF_UNICODETEXT（テキスト）をクリップボードから読む。
+    クリップボードは 1 回だけ開いて両フォーマットを確認する。
+    OpenClipboard 失敗時は最大 3 回リトライする。
     """
-    result = []
-    try:
+    for _ in range(3):
         if not ctypes.windll.user32.OpenClipboard(None):
-            return result
+            time.sleep(0.02)
+            continue
         try:
+            # ファイルコピー（CF_HDROP）を優先
             h = ctypes.windll.user32.GetClipboardData(_CF_HDROP)
-            if not h:
-                return result
-            count = ctypes.windll.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
-            for i in range(count):
-                length = ctypes.windll.shell32.DragQueryFileW(h, i, None, 0)
-                if length:
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    ctypes.windll.shell32.DragQueryFileW(h, i, buf, length + 1)
-                    result.append(buf.value)
+            if h:
+                count = ctypes.windll.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+                names = []
+                for i in range(count):
+                    length = ctypes.windll.shell32.DragQueryFileW(h, i, None, 0)
+                    if length:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        ctypes.windll.shell32.DragQueryFileW(h, i, buf, length + 1)
+                        names.append(Path(buf.value).name)
+                if names:
+                    return "\n".join(names)
+
+            # テキスト（CF_UNICODETEXT）を確認
+            h = ctypes.windll.user32.GetClipboardData(_CF_UNICODETEXT)
+            if h:
+                ptr = ctypes.windll.kernel32.GlobalLock(h)
+                if ptr:
+                    try:
+                        return ctypes.wstring_at(ptr)
+                    finally:
+                        ctypes.windll.kernel32.GlobalUnlock(h)
+        except Exception:
+            pass
         finally:
             ctypes.windll.user32.CloseClipboard()
-    except Exception:
-        pass
-    return result
+        break
+    return ""
 
 
 def watch_clipboard(icon: pystray.Icon) -> None:
@@ -177,29 +193,14 @@ def watch_clipboard(icon: pystray.Icon) -> None:
         if seq == prev_seq:
             continue
 
-        # 変更を検出したら少し待ち、複数フォーマットの設定が完了した最終状態を読む
-        # （Windows はファイルコピー時に sequence を複数回変化させるため）
-        time.sleep(0.15)
+        # 変更検出後に少し待ち、Windows がすべてのフォーマットを書き終えた状態を読む
+        time.sleep(0.1)
         try:
-            seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+            prev_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
         except Exception:
-            pass
-        prev_seq = seq
+            prev_seq = seq
 
-        # テキストを優先取得
-        current = ""
-        try:
-            current = pyperclip.paste()
-        except Exception:
-            pass
-
-        # テキストが空なら CF_HDROP（ファイルコピー）を確認し、ファイル名を記録する
-        # クリップボード本体は変更しないため、通常のファイル貼り付けは阻害されない
-        if not current:
-            paths = _get_clipboard_filenames()
-            if paths:
-                current = "\n".join(Path(p).name for p in paths)
-
+        current = _read_clipboard()
         if not current:
             continue
 
