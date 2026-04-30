@@ -138,6 +138,22 @@ def save_history() -> None:
 
 # ---------- クリップボード監視 ----------
 
+
+# GetClipboardData / DragQueryFileW の戻り値を 64 ビットポインタとして正しく受け取る
+# （ctypes.windll のデフォルト restype は c_long=32bit のため 64bit 環境でハンドルが壊れる）
+_GetClipboardData = ctypes.windll.user32.GetClipboardData
+_GetClipboardData.restype = ctypes.c_void_p          # HANDLE は void* サイズ
+
+_DragQueryFileW = ctypes.windll.shell32.DragQueryFileW
+_DragQueryFileW.restype  = ctypes.c_uint              # 戻り値は UINT（ファイル数 or 長さ）
+_DragQueryFileW.argtypes = [
+    ctypes.c_void_p,   # HDROP hDrop
+    ctypes.c_uint,     # UINT  iFile  (0xFFFFFFFF でファイル数取得)
+    ctypes.c_wchar_p,  # LPWSTR lpszFile
+    ctypes.c_uint,     # UINT  cch
+]
+
+
 def _read_clipboard() -> str:
     """クリップボードの内容を文字列として返す。
     CF_HDROP（ファイルコピー）を優先し、なければ pyperclip でテキストを取得する。
@@ -151,15 +167,15 @@ def _read_clipboard() -> str:
                 time.sleep(0.02)
                 continue
             try:
-                h = ctypes.windll.user32.GetClipboardData(_CF_HDROP)
+                h = _GetClipboardData(_CF_HDROP)
                 if h:
-                    count = ctypes.windll.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+                    count = _DragQueryFileW(h, 0xFFFFFFFF, None, 0)
                     names = []
                     for i in range(count):
-                        length = ctypes.windll.shell32.DragQueryFileW(h, i, None, 0)
+                        length = _DragQueryFileW(h, i, None, 0)
                         if length:
                             buf = ctypes.create_unicode_buffer(length + 1)
-                            ctypes.windll.shell32.DragQueryFileW(h, i, buf, length + 1)
+                            _DragQueryFileW(h, i, buf, length + 1)
                             names.append(Path(buf.value).name)
                     if names:
                         return "\n".join(names)
