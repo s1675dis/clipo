@@ -167,15 +167,23 @@ def watch_clipboard(icon: pystray.Icon) -> None:
     prev_seq = ctypes.windll.user32.GetClipboardSequenceNumber()
 
     while not getattr(icon, "_stop_event", threading.Event()).is_set():
+        time.sleep(POLL_INTERVAL)
+
         try:
             seq = ctypes.windll.user32.GetClipboardSequenceNumber()
         except Exception:
-            time.sleep(POLL_INTERVAL)
             continue
 
         if seq == prev_seq:
-            time.sleep(POLL_INTERVAL)
             continue
+
+        # 変更を検出したら少し待ち、複数フォーマットの設定が完了した最終状態を読む
+        # （Windows はファイルコピー時に sequence を複数回変化させるため）
+        time.sleep(0.15)
+        try:
+            seq = ctypes.windll.user32.GetClipboardSequenceNumber()
+        except Exception:
+            pass
         prev_seq = seq
 
         # テキストを優先取得
@@ -204,8 +212,6 @@ def watch_clipboard(icon: pystray.Icon) -> None:
                 history.pop()
         save_history()
         icon.update_menu()
-
-        time.sleep(POLL_INTERVAL)
 
 
 # ---------- トレイアイコン画像 ----------
